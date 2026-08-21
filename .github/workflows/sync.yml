@@ -1,0 +1,1132 @@
+name: Sync Sukka Mihomo Rules V2.3.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Operation mode"
+        required: true
+        default: "sync"
+        type: choice
+        options:
+          - sync
+          - rollback
+
+      backup_tag:
+        description: "Backup tag for rollback"
+        required: false
+        type: string
+
+  schedule:
+    # 每天 UTC 06:20 自动检查一次
+    - cron: "20 6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sukka-mihomo-rules
+  cancel-in-progress: false
+
+
+jobs:
+
+  # ==============================================================
+  # 正常同步
+  # ==============================================================
+
+  sync:
+
+    if: >
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.mode == 'sync')
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 20
+
+    env:
+      SOURCE_BASE: https://ruleset.skk.moe
+
+      MIN_TOTAL_RULES: 20
+
+      MAX_RULE_DROP_PERCENT: 30
+
+      MIN_FILE_SIZE: 5
+
+      KEEP_BACKUPS: 5
+
+
+    steps:
+
+      # ==========================================================
+      # 1. Checkout
+      # ==========================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+
+      # ==========================================================
+      # 2. 准备临时目录
+      # ==========================================================
+
+      - name: Prepare workspace
+        run: |
+          set -euo pipefail
+
+          rm -rf /tmp/sukka
+
+          mkdir -p /tmp/sukka/new/rules/domain
+          mkdir -p /tmp/sukka/new/rules/non_ip
+          mkdir -p /tmp/sukka/new/rules/ip
+
+
+      # ==========================================================
+      # 3. 下载 Sukka 首页
+      # ==========================================================
+
+      - name: Fetch Sukka index
+        run: |
+          set -euo pipefail
+
+          echo "Fetching Sukka rules index..."
+
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --retry 5 \
+            --retry-delay 3 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            --max-time 60 \
+            "${SOURCE_BASE}/" \
+            -o /tmp/sukka/index.html
+
+          if [ ! -s /tmp/sukka/index.html ]; then
+            echo "ERROR: Sukka index is empty."
+            exit 1
+          fi
+
+          SIZE=$(wc -c < /tmp/sukka/index.html)
+
+          echo "Index size: ${SIZE} bytes"
+
+          if [ "${SIZE}" -lt 500 ]; then
+            echo "ERROR: Sukka index looks abnormal."
+            exit 1
+          fi
+
+
+      # ==========================================================
+      # 4. 自动发现所有 Clash/Mihomo 规则
+      # ==========================================================
+
+      - name: Discover Mihomo rules
+        run: |
+          set -euo pipefail
+
+          grep -oE \
+            'Clash/(domainset|non_ip|ip)/[^"<> ]+\.txt' \
+            /tmp/sukka/index.html \
+            | sed 's/&amp;/\&/g' \
+            | sort -u \
+            > /tmp/sukka/files.txt
+
+          TOTAL=$(wc -l < /tmp/sukka/files.txt)
+
+          DOMAINSET=$(
+            grep -c '^Clash/domainset/' \
+            /tmp/sukka/files.txt || true
+          )
+
+          NON_IP=$(
+            grep -c '^Clash/non_ip/' \
+            /tmp/sukka/files.txt || true
+          )
+
+          IP=$(
+            grep -c '^Clash/ip/' \
+            /tmp/sukka/files.txt || true
+          )
+
+          echo ""
+          echo "===================================="
+          echo " Sukka Rules"
+          echo "===================================="
+          echo " domain    : ${DOMAINSET}"
+          echo " non_ip    : ${NON_IP}"
+          echo " ip        : ${IP}"
+          echo "------------------------------------"
+          echo " TOTAL     : ${TOTAL}"
+          echo "===================================="
+
+          if [ "${TOTAL}" -lt "${MIN_TOTAL_RULES}" ]; then
+            echo "ERROR: Too few rules discovered."
+            exit 1
+          fi
+
+          if [ "${DOMAINSET}" -eq 0 ] || \
+             [ "${NON_IP}" -eq 0 ] || \
+             [ "${IP}" -eq 0 ]; then
+
+            echo "ERROR: Missing rule category."
+            exit 1
+          fi
+
+
+      # ==========================================================
+      # 5. 当前规则数量异常保护
+      # ==========================================================
+
+      - name: Check rule count anomaly
+        run: |
+          set -euo pipefail
+
+          NEW_TOTAL=$(wc -l < /tmp/sukka/files.txt)
+
+          if [ ! -d rules ]; then
+            echo "First short-path synchronization."
+            exit 0
+          fi
+
+          OLD_TOTAL=$(
+            find rules \
+              -type f \
+              -name "*.txt" \
+              | wc -l
+          )
+
+          echo "Current : ${OLD_TOTAL}"
+          echo "New     : ${NEW_TOTAL}"
+
+          if [ "${OLD_TOTAL}" -eq 0 ]; then
+            exit 0
+          fi
+
+          if [ "${NEW_TOTAL}" -lt "${OLD_TOTAL}" ]; then
+
+            DROP=$((OLD_TOTAL - NEW_TOTAL))
+            DROP_PERCENT=$((DROP * 100 / OLD_TOTAL))
+
+            echo "Rule decrease: ${DROP_PERCENT}%"
+
+            if [ "${DROP_PERCENT}" \
+              -gt "${MAX_RULE_DROP_PERCENT}" ]; then
+
+              echo "ERROR: Abnormal rule count decrease."
+
+              exit 1
+            fi
+          fi
+
+
+      # ==========================================================
+      # 6. 下载并转换为短路径
+      #
+      # Clash/domainset → rules/domain
+      # Clash/non_ip    → rules/non_ip
+      # Clash/ip        → rules/ip
+      # ==========================================================
+
+      - name: Download rules
+        run: |
+          set -euo pipefail
+
+          SUCCESS=0
+
+          while IFS= read -r FILE; do
+
+            [ -z "${FILE}" ] && continue
+
+            case "${FILE}" in
+
+              Clash/domainset/*)
+
+                NAME="${FILE#Clash/domainset/}"
+
+                DEST="/tmp/sukka/new/rules/domain/${NAME}"
+
+                ;;
+
+              Clash/non_ip/*)
+
+                NAME="${FILE#Clash/non_ip/}"
+
+                DEST="/tmp/sukka/new/rules/non_ip/${NAME}"
+
+                ;;
+
+              Clash/ip/*)
+
+                NAME="${FILE#Clash/ip/}"
+
+                DEST="/tmp/sukka/new/rules/ip/${NAME}"
+
+                ;;
+
+              *)
+
+                echo "ERROR: Unknown path:"
+                echo "${FILE}"
+
+                exit 1
+
+                ;;
+
+            esac
+
+            echo "↓ ${FILE}"
+            echo "  → ${DEST}"
+
+            curl \
+              --fail \
+              --location \
+              --silent \
+              --show-error \
+              --retry 5 \
+              --retry-delay 3 \
+              --retry-all-errors \
+              --connect-timeout 15 \
+              --max-time 120 \
+              "${SOURCE_BASE}/${FILE}" \
+              -o "${DEST}"
+
+            SUCCESS=$((SUCCESS + 1))
+
+          done < /tmp/sukka/files.txt
+
+          echo ""
+          echo "Downloaded ${SUCCESS} rules."
+
+
+      # ==========================================================
+      # 7. 文件完整性检查
+      # ==========================================================
+
+      - name: Validate downloaded rules
+        run: |
+          set -euo pipefail
+
+          EXPECTED=$(wc -l < /tmp/sukka/files.txt)
+
+          ACTUAL=$(
+            find /tmp/sukka/new/rules \
+              -type f \
+              -name "*.txt" \
+              | wc -l
+          )
+
+          echo "Expected : ${EXPECTED}"
+          echo "Actual   : ${ACTUAL}"
+
+          if [ "${EXPECTED}" -ne "${ACTUAL}" ]; then
+            echo "ERROR: Rule count mismatch."
+            exit 1
+          fi
+
+          FAILED=0
+
+          while IFS= read -r TARGET; do
+
+            SIZE=$(wc -c < "${TARGET}")
+
+            if [ "${SIZE}" -lt "${MIN_FILE_SIZE}" ]; then
+
+              echo "ERROR: Suspicious file:"
+              echo "${TARGET}"
+
+              FAILED=1
+            fi
+
+            if grep -qiE \
+              '<!DOCTYPE html|<html|<head>|<body>|404 Not Found|403 Forbidden|500 Internal Server Error' \
+              "${TARGET}"; then
+
+              echo "ERROR: HTML/error response:"
+              echo "${TARGET}"
+
+              FAILED=1
+            fi
+
+          done < <(
+            find /tmp/sukka/new/rules \
+              -type f \
+              -name "*.txt"
+          )
+
+          if [ "${FAILED}" -ne 0 ]; then
+            echo "ERROR: Rule validation failed."
+            exit 1
+          fi
+
+
+      # ==========================================================
+      # 8. 分类检查
+      # ==========================================================
+
+      - name: Verify categories
+        run: |
+          set -euo pipefail
+
+          DOMAIN=$(
+            find /tmp/sukka/new/rules/domain \
+              -type f \
+              -name "*.txt" \
+              | wc -l
+          )
+
+          NON_IP=$(
+            find /tmp/sukka/new/rules/non_ip \
+              -type f \
+              -name "*.txt" \
+              | wc -l
+          )
+
+          IP=$(
+            find /tmp/sukka/new/rules/ip \
+              -type f \
+              -name "*.txt" \
+              | wc -l
+          )
+
+          TOTAL=$((DOMAIN + NON_IP + IP))
+
+          echo ""
+          echo "===================================="
+          echo " Short Path Rules"
+          echo "===================================="
+          echo " domain : ${DOMAIN}"
+          echo " non_ip : ${NON_IP}"
+          echo " ip     : ${IP}"
+          echo "------------------------------------"
+          echo " TOTAL  : ${TOTAL}"
+          echo "===================================="
+
+          if [ "${TOTAL}" -lt "${MIN_TOTAL_RULES}" ]; then
+            echo "ERROR: Invalid rule count."
+            exit 1
+          fi
+
+
+      # ==========================================================
+      # 9. 生成新规则 SHA256
+      # ==========================================================
+
+      - name: Generate new checksum
+        run: |
+          set -euo pipefail
+
+          cd /tmp/sukka/new
+
+          find rules \
+            -type f \
+            -name "*.txt" \
+            -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            > /tmp/sukka/new.sha256
+
+          sha256sum /tmp/sukka/new.sha256 \
+            | awk '{print $1}' \
+            > /tmp/sukka/new.master
+
+          echo "New version:"
+
+          cat /tmp/sukka/new.master
+
+
+      # ==========================================================
+      # 10. 当前规则 SHA256
+      # ==========================================================
+
+      - name: Generate current checksum
+        run: |
+          set -euo pipefail
+
+          if [ -d rules ] && \
+             find rules \
+               -type f \
+               -name "*.txt" \
+               | grep -q .; then
+
+            find rules \
+              -type f \
+              -name "*.txt" \
+              -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > /tmp/sukka/current.sha256
+
+            sha256sum /tmp/sukka/current.sha256 \
+              | awk '{print $1}' \
+              > /tmp/sukka/current.master
+
+          else
+
+            echo "none" \
+              > /tmp/sukka/current.master
+
+          fi
+
+          echo "Current version:"
+
+          cat /tmp/sukka/current.master
+
+
+      # ==========================================================
+      # 11. 比较规则
+      # ==========================================================
+
+      - name: Compare rules
+        id: compare
+        run: |
+          set -euo pipefail
+
+          OLD_HASH=$(cat /tmp/sukka/current.master)
+
+          NEW_HASH=$(cat /tmp/sukka/new.master)
+
+          echo "Old: ${OLD_HASH}"
+          echo "New: ${NEW_HASH}"
+
+          if [ "${OLD_HASH}" = "${NEW_HASH}" ]; then
+
+            echo "changed=false" \
+              >> "$GITHUB_OUTPUT"
+
+            echo "Rules already up to date."
+
+          else
+
+            echo "changed=true" \
+              >> "$GITHUB_OUTPUT"
+
+            echo "New rules detected."
+
+          fi
+
+
+      # ==========================================================
+      # 12. 无变化
+      # ==========================================================
+
+      - name: No update required
+        if: steps.compare.outputs.changed == 'false'
+        run: |
+          echo ""
+          echo "===================================="
+          echo " Sukka Mihomo Rules V2.3.1"
+          echo "===================================="
+          echo " STATUS : UP TO DATE"
+          echo " COMMIT : NO"
+          echo "===================================="
+
+
+      # ==========================================================
+      # 13. 创建更新前备份
+      # ==========================================================
+
+      - name: Create backup tag
+        id: backup
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          # 优先备份短路径版本
+          # 如果这是从旧 V2.3 升级，则备份旧 Clash 版本
+          if [ ! -d rules ] && [ ! -d Clash ]; then
+
+            echo "First synchronization."
+
+            echo "created=false" \
+              >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          BACKUP_TAG="backup-$(date -u '+%Y%m%d-%H%M%S')"
+
+          git tag \
+            -a "${BACKUP_TAG}" \
+            -m "Sukka Mihomo Rules backup before update"
+
+          git push origin "${BACKUP_TAG}"
+
+          echo "created=true" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "tag=${BACKUP_TAG}" \
+            >> "$GITHUB_OUTPUT"
+
+
+      # ==========================================================
+      # 14. 创建 GitHub Release
+      # ==========================================================
+
+      - name: Create backup release
+        if: >
+          steps.compare.outputs.changed == 'true' &&
+          steps.backup.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.backup.outputs.tag }}"
+
+          gh release create "${TAG}" \
+            --title "Mihomo Rules Backup ${TAG}" \
+            --notes "Automatic backup created before Sukka rules update.
+
+          Restore this backup using V2.3.1 rollback mode."
+
+
+      # ==========================================================
+      # 15. 替换正式规则
+      # ==========================================================
+
+      - name: Replace rules
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          rm -rf rules.new
+
+          cp -a \
+            /tmp/sukka/new/rules \
+            rules.new
+
+          NEW_COUNT=$(
+            find rules.new \
+              -type f \
+              -name "*.txt" \
+              | wc -l
+          )
+
+          if [ "${NEW_COUNT}" \
+            -lt "${MIN_TOTAL_RULES}" ]; then
+
+            echo "ERROR: Pre-replacement validation failed."
+
+            rm -rf rules.new
+
+            exit 1
+          fi
+
+          rm -rf rules
+
+          mv rules.new rules
+
+          # ======================================================
+          # 删除旧 V2.3 Clash 目录
+          # ======================================================
+
+          rm -rf Clash
+
+
+      # ==========================================================
+      # 16. 保存校验文件
+      # ==========================================================
+
+      - name: Save checksums
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          cp \
+            /tmp/sukka/new.sha256 \
+            RULES_SHA256SUMS.txt
+
+          cp \
+            /tmp/sukka/new.master \
+            RULES_VERSION.sha256
+
+
+      # ==========================================================
+      # 17. README
+      # ==========================================================
+
+      - name: Update README
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          DOMAIN=$(
+            find rules/domain \
+              -type f \
+              -name "*.txt" \
+              | wc -l
+          )
+
+          NON_IP=$(
+            find rules/non_ip \
+              -type f \
+              -name "*.txt" \
+              | wc -l
+          )
+
+          IP=$(
+            find rules/ip \
+              -type f \
+              -name "*.txt" \
+              | wc -l
+          )
+
+          TOTAL=$((DOMAIN + NON_IP + IP))
+
+          VERSION=$(cat RULES_VERSION.sha256)
+
+          cat > README.md <<EOF
+          # Sukka Mihomo Rules
+
+          SukkaW Clash / Mihomo 规则自动镜像。
+
+          ## Short Path
+
+          Sukka 原始目录：
+
+          \`\`\`
+          Clash/domainset
+          Clash/non_ip
+          Clash/ip
+          \`\`\`
+
+          自动转换：
+
+          \`\`\`
+          rules/domain
+          rules/non_ip
+          rules/ip
+          \`\`\`
+
+          ## Rule Count
+
+          | Type | Count |
+          |---|---:|
+          | domain | ${DOMAIN} |
+          | non_ip | ${NON_IP} |
+          | ip | ${IP} |
+          | Total | ${TOTAL} |
+
+          ## Current Version
+
+          \`\`\`
+          ${VERSION}
+          \`\`\`
+
+          ## Raw URL
+
+          \`\`\`
+          https://raw.githubusercontent.com/locksherneo/mihomo-sukka-rules/main/rules/
+          \`\`\`
+
+          Example:
+
+          \`\`\`
+          https://raw.githubusercontent.com/locksherneo/mihomo-sukka-rules/main/rules/domain/game-download.txt
+          \`\`\`
+
+          ## Sync
+
+          - 每 24 小时检查一次
+          - 自动发现 Sukka 新规则
+          - 无变化不 Commit
+          - 下载失败保留旧版本
+          - 规则数量异常保护
+          - SHA256 完整性检查
+          - 更新前自动备份
+          - 最近 5 个版本
+          - 支持手动回滚
+
+          ---
+
+          Automatically maintained by GitHub Actions.
+          EOF
+
+
+      # ==========================================================
+      # 18. 最终检查
+      # ==========================================================
+
+      - name: Final validation
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          TOTAL=$(
+            find rules \
+              -type f \
+              -name "*.txt" \
+              | wc -l
+          )
+
+          if [ "${TOTAL}" \
+            -lt "${MIN_TOTAL_RULES}" ]; then
+
+            echo "ERROR: Final rule count invalid."
+
+            exit 1
+          fi
+
+          if [ ! -s RULES_VERSION.sha256 ]; then
+            echo "ERROR: Missing RULES_VERSION.sha256"
+            exit 1
+          fi
+
+          if [ ! -s RULES_SHA256SUMS.txt ]; then
+            echo "ERROR: Missing RULES_SHA256SUMS.txt"
+            exit 1
+          fi
+
+
+      # ==========================================================
+      # 19. Commit
+      # ==========================================================
+
+      - name: Commit changes
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # -A 很重要：
+          # 同时记录旧 Clash 目录删除
+          git add -A
+
+          if git diff \
+            --cached \
+            --quiet; then
+
+            echo "No effective changes."
+
+            exit 0
+          fi
+
+          git commit \
+            -m "chore: sync Sukka Mihomo rules"
+
+          git push
+
+
+      # ==========================================================
+      # 20. 清理旧备份，只留最近 5 个
+      # ==========================================================
+
+      - name: Cleanup old backups
+        if: >
+          steps.compare.outputs.changed == 'true' &&
+          steps.backup.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] |
+              select(.tag_name | startswith("backup-")) |
+              [.created_at, .tag_name] |
+              @tsv' \
+            | sort -r \
+            > /tmp/sukka/backups.txt
+
+          TOTAL_BACKUPS=$(
+            wc -l < /tmp/sukka/backups.txt
+          )
+
+          echo "Backups: ${TOTAL_BACKUPS}"
+
+          if [ "${TOTAL_BACKUPS}" \
+            -le "${KEEP_BACKUPS}" ]; then
+
+            echo "No backup cleanup required."
+
+            exit 0
+          fi
+
+          tail \
+            -n "+$((KEEP_BACKUPS + 1))" \
+            /tmp/sukka/backups.txt \
+            | cut -f2 \
+            > /tmp/sukka/delete.txt
+
+          while IFS= read -r TAG; do
+
+            [ -z "${TAG}" ] && continue
+
+            echo "Delete old backup: ${TAG}"
+
+            gh release delete "${TAG}" \
+              --yes \
+              --cleanup-tag
+
+          done < /tmp/sukka/delete.txt
+
+
+      # ==========================================================
+      # 21. 完成
+      # ==========================================================
+
+      - name: Sync completed
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          echo ""
+          echo "===================================="
+          echo " Sukka Mihomo Rules V2.3.1"
+          echo "===================================="
+          echo " STATUS : UPDATED"
+          echo " PATH   : SHORT"
+          echo " SAFETY : PASSED"
+          echo "===================================="
+
+
+
+  # ==============================================================
+  # 回滚
+  # ==============================================================
+
+  rollback:
+
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'rollback'
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+
+      # ==========================================================
+      # 检查输入
+      # ==========================================================
+
+      - name: Validate backup tag
+        run: |
+          set -euo pipefail
+
+          TAG="${{ inputs.backup_tag }}"
+
+          if [ -z "${TAG}" ]; then
+            echo "ERROR: backup_tag is required."
+            exit 1
+          fi
+
+          case "${TAG}" in
+            backup-*)
+              ;;
+            *)
+              echo "ERROR: Invalid backup tag."
+              exit 1
+              ;;
+          esac
+
+
+      # ==========================================================
+      # 获取 Tags
+      # ==========================================================
+
+      - name: Fetch tags
+        run: |
+          git fetch \
+            --force \
+            --tags
+
+
+      # ==========================================================
+      # 检查备份
+      # ==========================================================
+
+      - name: Verify backup
+        run: |
+          set -euo pipefail
+
+          TAG="${{ inputs.backup_tag }}"
+
+          if ! git rev-parse \
+            "${TAG}^{commit}" \
+            >/dev/null 2>&1; then
+
+            echo "ERROR: Backup not found:"
+            echo "${TAG}"
+
+            exit 1
+          fi
+
+
+      # ==========================================================
+      # 恢复备份
+      #
+      # 同时兼容：
+      # V2.3 旧 Clash 备份
+      # V2.3.1 新 rules 备份
+      # ==========================================================
+
+      - name: Restore backup
+        run: |
+          set -euo pipefail
+
+          TAG="${{ inputs.backup_tag }}"
+
+          rm -rf rules
+          rm -rf Clash
+
+          # 新短路径备份
+          if git cat-file \
+            -e "${TAG}:rules" \
+            2>/dev/null; then
+
+            git checkout \
+              "${TAG}" \
+              -- rules
+
+            echo "Restored short-path rules."
+
+          # 兼容旧 V2.3 Clash 备份
+          elif git cat-file \
+            -e "${TAG}:Clash" \
+            2>/dev/null; then
+
+            git checkout \
+              "${TAG}" \
+              -- Clash
+
+            echo "Restored legacy Clash backup."
+
+          else
+
+            echo "ERROR:"
+            echo "No rules found in backup."
+
+            exit 1
+
+          fi
+
+          if git cat-file \
+            -e "${TAG}:RULES_SHA256SUMS.txt" \
+            2>/dev/null; then
+
+            git checkout \
+              "${TAG}" \
+              -- RULES_SHA256SUMS.txt
+          fi
+
+          if git cat-file \
+            -e "${TAG}:RULES_VERSION.sha256" \
+            2>/dev/null; then
+
+            git checkout \
+              "${TAG}" \
+              -- RULES_VERSION.sha256
+          fi
+
+
+      # ==========================================================
+      # 验证恢复
+      # ==========================================================
+
+      - name: Validate restored rules
+        run: |
+          set -euo pipefail
+
+          if [ -d rules ]; then
+
+            TOTAL=$(
+              find rules \
+                -type f \
+                -name "*.txt" \
+                | wc -l
+            )
+
+          elif [ -d Clash ]; then
+
+            TOTAL=$(
+              find Clash \
+                -type f \
+                -name "*.txt" \
+                | wc -l
+            )
+
+          else
+
+            echo "ERROR: Rules missing."
+
+            exit 1
+          fi
+
+          echo "Restored: ${TOTAL}"
+
+          if [ "${TOTAL}" -lt 20 ]; then
+            echo "ERROR: Backup incomplete."
+            exit 1
+          fi
+
+
+      # ==========================================================
+      # Commit 回滚
+      # ==========================================================
+
+      - name: Commit rollback
+        run: |
+          set -euo pipefail
+
+          TAG="${{ inputs.backup_tag }}"
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff \
+            --cached \
+            --quiet; then
+
+            echo "Already matches backup."
+
+            exit 0
+          fi
+
+          git commit \
+            -m "rollback: restore Sukka rules from ${TAG}"
+
+          git push
+
+
+      # ==========================================================
+      # 完成
+      # ==========================================================
+
+      - name: Rollback completed
+        run: |
+          echo ""
+          echo "===================================="
+          echo " Sukka Mihomo Rules V2.3.1"
+          echo "===================================="
+          echo " STATUS : ROLLED BACK"
+          echo " BACKUP : ${{ inputs.backup_tag }}"
+          echo "===================================="
